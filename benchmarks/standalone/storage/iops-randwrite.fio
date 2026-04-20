@@ -1,0 +1,13 @@
+[global]
+ioengine=libaio
+direct=1
+bs=4K
+iodepth=16
+numjobs=32
+size=32G
+time_based
+runtime=600
+group_reporting
+
+[fiotest]
+rw=randwrite
