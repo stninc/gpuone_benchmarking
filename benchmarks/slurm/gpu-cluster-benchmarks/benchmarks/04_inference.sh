@@ -18,6 +18,11 @@ header "Benchmark 04 — Inference Throughput (vLLM)"
 INFER_DIR="${RESULTS_DIR}/04_inference"
 mkdir -p "${INFER_DIR}"
 
+# Generate sourceable NCCL env file from cluster.conf vars currently in env.
+# The container runner sources this AFTER nuking image-baked NCCL_*/UCX_* vars.
+BENCH_NCCL_ENV_FILE="${INFER_DIR}/nccl_env.sh"
+write_nccl_env_file "${BENCH_NCCL_ENV_FILE}"
+
 # ── Configurable parameters ───────────────────────────────────────────────────
 INFER_MODEL="${INFER_MODEL:-Qwen/Qwen2.5-14B-Instruct}"
 INFER_TP="${INFER_TP:-${GPUS_PER_NODE}}"
@@ -180,13 +185,24 @@ cat > "${INFER_DIR}/infer_runner.sh" <<'RUNEOF'
 #!/bin/bash
 set -e
 
-# ── Nuke toxic NCCL/UCX env vars ─────────────────────────────────────────────
+# ── Step 1: Nuke image-baked NCCL/UCX env vars ────────────────────────────────
 for var in $(env | grep -oP '^(NCCL_|UCX_|NVSHMEM_|HPCX_|OMPI_MCA_)[^=]*'); do
     unset "$var"
 done
 
-export NCCL_IB_DISABLE=0
-export NCCL_SOCKET_IFNAME=bond0
+# ── Step 2: Re-apply user's NCCL config from cluster.conf ────────────────────
+if [[ -z "${BENCH_NCCL_ENV_FILE:-}" ]]; then
+    echo "WARNING: BENCH_NCCL_ENV_FILE not set in env — NCCL config from cluster.conf will NOT be applied" >&2
+elif [[ ! -f "${BENCH_NCCL_ENV_FILE}" ]]; then
+    echo "WARNING: BENCH_NCCL_ENV_FILE=${BENCH_NCCL_ENV_FILE} does not exist on this host — check container mounts" >&2
+else
+    echo "Sourcing NCCL env file: ${BENCH_NCCL_ENV_FILE}"
+    # shellcheck disable=SC1090
+    source "${BENCH_NCCL_ENV_FILE}"
+fi
+
+# ── Step 3: Defensive defaults ───────────────────────────────────────────────
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}
 
 echo "=== Inference Benchmark ==="
@@ -194,6 +210,16 @@ echo "Hostname: $(hostname)"
 echo "Model: ${INFER_MODEL}"
 echo "TP: ${INFER_TP}"
 echo "GPUs: $(nvidia-smi -L | wc -l)"
+echo ""
+echo "=== Effective NCCL env ==="
+env | grep -E '^(NCCL_|UCX_)' | sort
+echo ""
+
+echo "=== RDMA visibility check ==="
+echo "/dev/infiniband contents:"
+ls /dev/infiniband/ 2>&1 | head -10 | sed 's/^/  /'
+echo "ibv_devices output:"
+(command -v ibv_devices >/dev/null && ibv_devices 2>&1 || echo "  ibv_devices not installed") | head -10 | sed 's/^/  /'
 echo ""
 
 # Install vLLM if not present
@@ -240,10 +266,10 @@ INFER_JOB=$(sbatch --parsable \
     --gpus-per-node="${GPUS_PER_NODE}" \
     --time=02:00:00 \
     --output="${INFER_DIR}/slurm-%j.out" \
-    --export=ALL,INFER_DIR="${INFER_DIR}",INFER_MODEL="${INFER_MODEL}",INFER_TP="${INFER_TP}",INFER_INPUT_LEN="${INFER_INPUT_LEN}",INFER_OUTPUT_LEN="${INFER_OUTPUT_LEN}",INFER_NUM_PROMPTS="${INFER_NUM_PROMPTS}"${HF_EXPORT} \
+    --export=ALL,INFER_DIR="${INFER_DIR}",BENCH_NCCL_ENV_FILE="${BENCH_NCCL_ENV_FILE}",INFER_MODEL="${INFER_MODEL}",INFER_TP="${INFER_TP}",INFER_INPUT_LEN="${INFER_INPUT_LEN}",INFER_OUTPUT_LEN="${INFER_OUTPUT_LEN}",INFER_NUM_PROMPTS="${INFER_NUM_PROMPTS}"${HF_EXPORT} \
     --wrap="srun ${PYXIS_COMMON} \
         --container-image=${PYTORCH_IMAGE} \
-        --container-mounts=${INFER_DIR}:${INFER_DIR} \
+        --container-mounts=${PYXIS_MOUNTS},${INFER_DIR}:${INFER_DIR} \
         bash ${INFER_DIR}/infer_runner.sh" \
     2>&1) || { fail "Failed to submit inference job"; INFER_JOB=""; }
 

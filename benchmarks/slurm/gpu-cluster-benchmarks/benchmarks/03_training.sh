@@ -20,6 +20,11 @@ header "Benchmark 03 — Multi-Node Training MFU"
 TRAIN_DIR="${RESULTS_DIR}/03_training"
 mkdir -p "${TRAIN_DIR}"
 
+# Generate sourceable NCCL env file from cluster.conf vars currently in env.
+# The container runner sources this AFTER nuking image-baked NCCL_*/UCX_* vars.
+BENCH_NCCL_ENV_FILE="${TRAIN_DIR}/nccl_env.sh"
+write_nccl_env_file "${BENCH_NCCL_ENV_FILE}"
+
 # ── Configurable training parameters ──────────────────────────────────────────
 TRAIN_MODEL="${TRAIN_MODEL:-Qwen/Qwen2.5-7B}"
 TRAIN_STEPS="${TRAIN_STEPS:-100}"
@@ -58,10 +63,12 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
 
     print(f"[rank {global_rank}] Calling dist.init_process_group('nccl')...", flush=True)
+    # NOTE: No device_id= here. Setting device_id triggers NCCL eager mode (new in
+    # 2.29) which has shown issues with large FSDP all_gathers. Lazy init is the
+    # battle-tested path.
     dist.init_process_group(
         "nccl",
         timeout=datetime.timedelta(minutes=5),
-        device_id=device,
     )
     world_size = dist.get_world_size()
     print(f"[rank {global_rank}] NCCL init complete. World size: {world_size}", flush=True)
@@ -287,18 +294,35 @@ cat > "${TRAIN_DIR}/train_runner.sh" <<'TRAINEOF'
 #!/bin/bash
 set -euo pipefail
 
+# ── Step 1: Nuke image-baked NCCL/UCX env vars ────────────────────────────────
 for var in $(env | grep -oP '^(NCCL_|UCX_|NVSHMEM_|HPCX_|OMPI_MCA_)[^=]*'); do
     unset "$var"
 done
 unset GLOO_SOCKET_IFNAME 2>/dev/null || true
 
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+# ── Step 2: Re-apply user's NCCL config from cluster.conf ────────────────────
+if [[ -z "${BENCH_NCCL_ENV_FILE:-}" ]]; then
+    echo "WARNING: BENCH_NCCL_ENV_FILE not set in env — NCCL config from cluster.conf will NOT be applied" >&2
+elif [[ ! -f "${BENCH_NCCL_ENV_FILE}" ]]; then
+    echo "WARNING: BENCH_NCCL_ENV_FILE=${BENCH_NCCL_ENV_FILE} does not exist on this host — check container mounts" >&2
+else
+    echo "Sourcing NCCL env file: ${BENCH_NCCL_ENV_FILE}"
+    # shellcheck disable=SC1090
+    source "${BENCH_NCCL_ENV_FILE}"
+fi
+
+# ── Step 3: Defensive defaults + training-specific extras ────────────────────
+# Default to INFO so crashes during NCCL init (e.g. from eager mode) surface
+# the actual reason instead of just "Failed to initialize any NET plugin".
+# Override by setting NCCL_DEBUG=WARN in cluster.conf once things are stable.
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+# torchrun rendezvous uses GLOO; mirror NCCL_SOCKET_IFNAME so it picks the
+# right OOB interface (otherwise it tries to bind to all interfaces and hangs).
 if [[ -n "${NCCL_SOCKET_IFNAME:-}" ]]; then
-    export NCCL_SOCKET_IFNAME
     export GLOO_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}"
 fi
 
@@ -312,7 +336,15 @@ echo "Model:     ${TRAIN_MODEL}"
 echo "Nodes:     ${SLURM_NNODES:-1}"
 echo "GPUs/node: ${GPUS_PER_NODE:-8}"
 echo ""
-env | grep -E '^(NCCL_|GLOO_|PYTORCH_CUDA_ALLOC_CONF)' | sort || true
+echo "=== Effective NCCL/GLOO env ==="
+env | grep -E '^(NCCL_|UCX_|GLOO_|PYTORCH_CUDA_ALLOC_CONF)' | sort || true
+echo ""
+
+echo "=== RDMA visibility check ==="
+echo "/dev/infiniband contents:"
+ls /dev/infiniband/ 2>&1 | head -10 | sed 's/^/  /'
+echo "ibv_devices output:"
+(command -v ibv_devices >/dev/null && ibv_devices 2>&1 || echo "  ibv_devices not installed") | head -10 | sed 's/^/  /'
 echo ""
 
 if ! python3 -c "import transformers" >/dev/null 2>&1; then
@@ -347,20 +379,26 @@ TRAINEOF
 chmod +x "${TRAIN_DIR}/train_runner.sh"
 
 # ── Host-side batch script (runs inside Slurm allocation, outside container) ─
-cat > "${TRAIN_DIR}/train_job.sh" <<'JOBEOF'
+# Heredoc is UNQUOTED so orchestrator-level variables expand here. SLURM
+# runtime vars (SLURM_*, MASTER_ADDR after it's set) are escaped with \$ so
+# they expand inside the batch script. This is necessary because passing
+# PYXIS_MOUNTS through sbatch --export breaks: sbatch --export uses comma
+# as a separator, so "/a:/a,/b:/b" gets split into two fake variables and
+# the /dev/infiniband mount silently disappears.
+cat > "${TRAIN_DIR}/train_job.sh" <<JOBEOF
 #!/bin/bash
 set -euo pipefail
 
-MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
+MASTER_ADDR="\$(scontrol show hostnames "\${SLURM_JOB_NODELIST}" | head -n 1)"
 export MASTER_ADDR
-export MASTER_PORT="${MASTER_PORT:-29500}"
+export MASTER_PORT="\${MASTER_PORT:-29500}"
 
-echo "Host-side resolved MASTER_ADDR=${MASTER_ADDR}:${MASTER_PORT}"
+echo "Host-side resolved MASTER_ADDR=\${MASTER_ADDR}:\${MASTER_PORT}"
 
-srun ${PYXIS_COMMON} \
-    --container-image="${PYTORCH_IMAGE}" \
-    --container-mounts="${TRAIN_DIR}:${TRAIN_DIR}" \
-    --export=ALL,MASTER_ADDR="${MASTER_ADDR}",MASTER_PORT="${MASTER_PORT}" \
+srun ${PYXIS_COMMON} \\
+    --container-image="${PYTORCH_IMAGE}" \\
+    --container-mounts="${PYXIS_MOUNTS},${TRAIN_DIR}:${TRAIN_DIR}" \\
+    --export=ALL,MASTER_ADDR="\${MASTER_ADDR}",MASTER_PORT="\${MASTER_PORT}",BENCH_NCCL_ENV_FILE="${BENCH_NCCL_ENV_FILE}" \\
     bash "${TRAIN_DIR}/train_runner.sh"
 JOBEOF
 
@@ -379,6 +417,7 @@ TRAIN_JOB=$(sbatch --parsable \
     --output="${TRAIN_DIR}/slurm-%j.out" \
     --export=ALL,\
 TRAIN_DIR="${TRAIN_DIR}",\
+BENCH_NCCL_ENV_FILE="${BENCH_NCCL_ENV_FILE}",\
 TRAIN_MODEL="${TRAIN_MODEL}",\
 TRAIN_STEPS="${TRAIN_STEPS}",\
 TRAIN_WARMUP="${TRAIN_WARMUP}",\
@@ -389,12 +428,8 @@ TRAIN_TRUST_REMOTE_CODE="${TRAIN_TRUST_REMOTE_CODE}",\
 GPUS_PER_NODE="${GPUS_PER_NODE}",\
 HF_TOKEN="${HF_TOKEN:-}",\
 MASTER_PORT="${MASTER_PORT}",\
-NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}",\
-NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}",\
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}",\
-PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}",\
-PYXIS_COMMON="${PYXIS_COMMON}",\
-PYTORCH_IMAGE="${PYTORCH_IMAGE}" \
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
     "${TRAIN_DIR}/train_job.sh" \
     2>&1) || { fail "Failed to submit training job"; TRAIN_JOB=""; }
 

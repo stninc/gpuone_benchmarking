@@ -171,7 +171,7 @@ JOB_ID=$(sbatch --parsable \
     --export=ALL,RESULTS_DIR="${GEMM_DIR}" \
     --wrap="srun ${PYXIS_COMMON} \
         --container-image=${PYTORCH_IMAGE} \
-        --container-mounts=${GEMM_DIR}:${GEMM_DIR} \
+        --container-mounts=${PYXIS_MOUNTS},${GEMM_DIR}:${GEMM_DIR} \
         bash -c 'python3 ${GEMM_DIR}/gemm_bench.py' " \
     2>&1) || { fail "Failed to submit GEMM job"; return 1; }
 

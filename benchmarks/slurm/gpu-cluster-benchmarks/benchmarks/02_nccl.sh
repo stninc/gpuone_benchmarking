@@ -18,38 +18,51 @@ source "${SCRIPT_DIR}/../configs/cluster.conf"
 header "Benchmark 02 — NCCL Collective Bandwidth"
 
 mkdir -p "${RESULTS_DIR}/02_nccl"
+NCCL_DIR="${RESULTS_DIR}/02_nccl"
 
-# ── NCCL environment block ────────────────────────────────────────────────────
-NCCL_ENV=""
-NCCL_ENV+="NCCL_IB_DISABLE=${NCCL_IB_DISABLE},"
-NCCL_ENV+="NCCL_CROSS_NIC=${NCCL_CROSS_NIC},"
-NCCL_ENV+="NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX},"
-NCCL_ENV+="NCCL_DEBUG=INFO,"
-NCCL_ENV+="NCCL_DEBUG_SUBSYS=INIT,NET"
-[[ -n "${NCCL_NET:-}" ]]           && NCCL_ENV+=",NCCL_NET=${NCCL_NET}"
-[[ -n "${NCCL_IB_HCA:-}" ]]       && NCCL_ENV+=",NCCL_IB_HCA=${NCCL_IB_HCA}"
-[[ -n "${NCCL_SOCKET_IFNAME:-}" ]] && NCCL_ENV+=",NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
+# ── Generate NCCL env file from cluster.conf ─────────────────────────────────
+# Captures every NCCL_*/UCX_*/etc var currently set, writes them to a file
+# the runner sources AFTER nuking image-baked vars. This is the single source
+# of truth for NCCL config — edit cluster.conf, not the runner.
+BENCH_NCCL_ENV_FILE="${NCCL_DIR}/nccl_env.sh"
+write_nccl_env_file "${BENCH_NCCL_ENV_FILE}"
 
 # ── Build & run nccl-tests inside the container ──────────────────────────────
-# We compile nccl-tests at job start inside the container (takes ~60s).
-# If your cluster caches a pre-built image, skip the build step.
 NCCL_BUILD_AND_RUN=$(cat <<'RUNEOF'
 #!/bin/bash
 set -e
 
-# ── Nuke ALL NCCL and UCX env vars from SLURM prolog / container image ────────
-# Then set ONLY the minimal known-good values. This matches the manual srun
-# command that works: just NCCL_IB_DISABLE=0, NCCL_SOCKET_IFNAME, LD_LIBRARY_PATH.
+# ── Step 1: Nuke image-baked NCCL/UCX env vars ────────────────────────────────
+# NGC containers ship with NCCL_IB_SL=1 / UCX_IB_TRAFFIC_CLASS=0xE0 baked in,
+# which can hit non-PFC priorities on some clusters and break QPs.
 for var in $(env | grep -oP '^(NCCL_|UCX_|NVSHMEM_|HPCX_|OMPI_MCA_)[^=]*'); do
     unset "$var"
 done
 
-export NCCL_IB_DISABLE=0
-export NCCL_SOCKET_IFNAME=bond0
+# ── Step 2: Re-apply user's intended config from cluster.conf ────────────────
+if [[ -z "${BENCH_NCCL_ENV_FILE:-}" ]]; then
+    echo "WARNING: BENCH_NCCL_ENV_FILE not set in env — NCCL config from cluster.conf will NOT be applied" >&2
+elif [[ ! -f "${BENCH_NCCL_ENV_FILE}" ]]; then
+    echo "WARNING: BENCH_NCCL_ENV_FILE=${BENCH_NCCL_ENV_FILE} does not exist on this host — check container mounts" >&2
+else
+    echo "Sourcing NCCL env file: ${BENCH_NCCL_ENV_FILE}"
+    # shellcheck disable=SC1090
+    source "${BENCH_NCCL_ENV_FILE}"
+fi
+
+# ── Step 3: Defensive defaults if cluster.conf left them blank ───────────────
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}
 
-echo "=== NCCL env (cleaned) ==="
-env | grep -E '^NCCL_' | sort
+echo "=== NCCL env (post-source) ==="
+env | grep -E '^(NCCL_|UCX_)' | sort
+echo ""
+
+echo "=== RDMA visibility check ==="
+echo "/dev/infiniband contents:"
+ls /dev/infiniband/ 2>&1 | head -10 | sed 's/^/  /'
+echo "ibv_devices output:"
+(command -v ibv_devices >/dev/null && ibv_devices 2>&1 || echo "  ibv_devices not installed") | head -10 | sed 's/^/  /'
 echo ""
 
 # Build nccl-tests WITHOUT MPI — avoids UCX wireup issues entirely
@@ -91,14 +104,12 @@ done
 RUNEOF
 )
 
-NCCL_RUNNER="${RESULTS_DIR}/02_nccl/nccl_runner.sh"
+NCCL_RUNNER="${NCCL_DIR}/nccl_runner.sh"
 echo "$NCCL_BUILD_AND_RUN" > "$NCCL_RUNNER"
 chmod +x "$NCCL_RUNNER"
 
 # ── Phase A: Intra-node (1 node, 8 GPUs) ─────────────────────────────────────
 info "Submitting intra-node NCCL test (1 node, ${GPUS_PER_NODE} GPUs, single process)..."
-
-NCCL_DIR="${RESULTS_DIR}/02_nccl"
 
 INTRA_JOB=$(sbatch --parsable \
     $(build_slurm_args) \
@@ -108,10 +119,10 @@ INTRA_JOB=$(sbatch --parsable \
     --gpus-per-node="${GPUS_PER_NODE}" \
     --time=00:30:00 \
     --output="${NCCL_DIR}/slurm-intra-%j.out" \
-    --export=ALL,RESULTS_DIR="${NCCL_DIR}",NCCL_GPUS_PER_PROC="${GPUS_PER_NODE}",NCCL_MIN_BYTES=8M,NCCL_MAX_BYTES=8G,NCCL_ITERS=100,NCCL_WARMUP=50,${NCCL_ENV} \
+    --export=ALL,RESULTS_DIR="${NCCL_DIR}",BENCH_NCCL_ENV_FILE="${BENCH_NCCL_ENV_FILE}",NCCL_GPUS_PER_PROC="${GPUS_PER_NODE}",NCCL_MIN_BYTES=8M,NCCL_MAX_BYTES=8G,NCCL_ITERS=100,NCCL_WARMUP=50 \
     --wrap="srun ${PYXIS_COMMON} \
         --container-image=${NCCL_TEST_IMAGE} \
-        --container-mounts=${NCCL_DIR}:${NCCL_DIR} \
+        --container-mounts=${PYXIS_MOUNTS},${NCCL_DIR}:${NCCL_DIR} \
         bash ${NCCL_RUNNER}" \
     2>&1) || { fail "Failed to submit intra-node NCCL job"; INTRA_JOB=""; }
 
@@ -130,10 +141,10 @@ if [[ "${NCCL_NODES}" -gt 1 ]]; then
         --gpus-per-node="${GPUS_PER_NODE}" \
         --time=00:45:00 \
         --output="${NCCL_DIR}/slurm-inter-%j.out" \
-        --export=ALL,RESULTS_DIR="${NCCL_DIR}",NCCL_GPUS_PER_PROC="${GPUS_PER_NODE}",NCCL_MIN_BYTES=8M,NCCL_MAX_BYTES=8G,NCCL_ITERS=50,NCCL_WARMUP=20,${NCCL_ENV} \
+        --export=ALL,RESULTS_DIR="${NCCL_DIR}",BENCH_NCCL_ENV_FILE="${BENCH_NCCL_ENV_FILE}",NCCL_GPUS_PER_PROC="${GPUS_PER_NODE}",NCCL_MIN_BYTES=8M,NCCL_MAX_BYTES=8G,NCCL_ITERS=50,NCCL_WARMUP=20 \
         --wrap="srun ${PYXIS_COMMON} \
             --container-image=${NCCL_TEST_IMAGE} \
-            --container-mounts=${NCCL_DIR}:${NCCL_DIR} \
+            --container-mounts=${PYXIS_MOUNTS},${NCCL_DIR}:${NCCL_DIR} \
             bash ${NCCL_RUNNER}" \
         2>&1) || { fail "Failed to submit inter-node NCCL job"; INTER_JOB=""; }
 
@@ -143,8 +154,8 @@ else
     INTER_JOB=""
 fi
 
-echo "$INTRA_JOB" > "${RESULTS_DIR}/02_nccl/intra_job_id"
-echo "${INTER_JOB:-none}" > "${RESULTS_DIR}/02_nccl/inter_job_id"
+echo "$INTRA_JOB" > "${NCCL_DIR}/intra_job_id"
+echo "${INTER_JOB:-none}" > "${NCCL_DIR}/inter_job_id"
 
 # ── Parse nccl-tests output ───────────────────────────────────────────────────
 # Extracts the bus bandwidth at the largest message size from each test log.
@@ -157,7 +168,11 @@ extract_nccl_busbw() {
     # nccl-tests output: last data line has the largest message size result
     # Columns: size(B)  count  type  redop  root  time(us)  algbw(GB/s)  busbw(GB/s)  error
     # We want busbw (column 12 in newer nccl-tests, or the second-to-last numeric column)
-    grep -E '^\s+[0-9]' "$logfile" | tail -1 | awk '{print $(NF-1)}' 2>/dev/null || echo "0"
+    # Force --text in case log has binary control bytes from container output;
+    # strip ANSI escapes before parsing.
+    grep -a -E '^\s+[0-9]' "$logfile" \
+        | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+        | tail -1 | awk '{print $(NF-1)}' 2>/dev/null || echo "0"
 }
 
 parse_nccl_results() {
