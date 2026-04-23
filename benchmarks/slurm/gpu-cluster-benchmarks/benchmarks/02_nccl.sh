@@ -28,6 +28,10 @@ BENCH_NCCL_ENV_FILE="${NCCL_DIR}/nccl_env.sh"
 write_nccl_env_file "${BENCH_NCCL_ENV_FILE}"
 
 # ── Build & run nccl-tests inside the container ──────────────────────────────
+# INTRA-NODE: nccl-tests built without MPI, single-process-multi-thread (-g 8).
+# INTER-NODE: single-process-per-rank across 2 nodes via torchrun bootstrap,
+#             running a Python wrapper that calls torch.distributed collectives
+#             (same measurement the test does, but actually spans nodes).
 NCCL_BUILD_AND_RUN=$(cat <<'RUNEOF'
 #!/bin/bash
 set -e
@@ -54,8 +58,13 @@ fi
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}
 
+# torchrun rendezvous uses GLOO; mirror NCCL_SOCKET_IFNAME so it binds correctly.
+if [[ -n "${NCCL_SOCKET_IFNAME:-}" ]]; then
+    export GLOO_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}"
+fi
+
 echo "=== NCCL env (post-source) ==="
-env | grep -E '^(NCCL_|UCX_)' | sort
+env | grep -E '^(NCCL_|UCX_|GLOO_)' | sort
 echo ""
 
 echo "=== RDMA visibility check ==="
@@ -65,42 +74,153 @@ echo "ibv_devices output:"
 (command -v ibv_devices >/dev/null && ibv_devices 2>&1 || echo "  ibv_devices not installed") | head -10 | sed 's/^/  /'
 echo ""
 
-# Build nccl-tests WITHOUT MPI — avoids UCX wireup issues entirely
-if [[ ! -x /tmp/nccl-tests/build/all_reduce_perf ]]; then
-    echo "[$(hostname)] Building nccl-tests (no MPI)..."
-    cd /tmp
-    git clone --depth 1 https://github.com/NVIDIA/nccl-tests.git 2>/dev/null || true
-    cd nccl-tests
-    make CUDA_HOME=/usr/local/cuda -j$(nproc)
-    echo "[$(hostname)] nccl-tests built successfully"
-fi
-
-TESTBIN="/tmp/nccl-tests/build"
 OUTDIR="${RESULTS_DIR:-/tmp}"
 MINBYTES="${NCCL_MIN_BYTES:-8M}"
 MAXBYTES="${NCCL_MAX_BYTES:-8G}"
 STEPFACTOR="${NCCL_STEP_FACTOR:-2}"
 ITERS="${NCCL_ITERS:-100}"
 WARMUP="${NCCL_WARMUP:-50}"
+NGPUS="${NCCL_GPUS_PER_PROC:-8}"
+NNODES="${SLURM_NNODES:-1}"
 
 echo "=== NCCL Test Configuration ==="
-echo "Hosts: $(hostname), Tasks: ${SLURM_NTASKS:-1}, GPUs/proc: ${NCCL_GPUS_PER_PROC:-8}"
+echo "Hostname: $(hostname)"
+echo "NNODES: ${NNODES}, NODE_RANK: ${SLURM_NODEID:-0}, GPUs/node: ${NGPUS}"
 echo "Bytes: ${MINBYTES} → ${MAXBYTES} (step ×${STEPFACTOR})"
 echo "Iters: ${ITERS}, Warmup: ${WARMUP}"
 echo ""
 
-NGPUS="${NCCL_GPUS_PER_PROC:-8}"
+if [[ "${NNODES}" -eq 1 ]]; then
+    # ── INTRA-NODE path: nccl-tests binary, single-proc-multi-thread ──
+    if [[ ! -x /tmp/nccl-tests/build/all_reduce_perf ]]; then
+        echo "[$(hostname)] Building nccl-tests (no MPI)..."
+        cd /tmp
+        git clone --depth 1 https://github.com/NVIDIA/nccl-tests.git 2>/dev/null || true
+        cd nccl-tests
+        make CUDA_HOME=/usr/local/cuda -j$(nproc)
+        echo "[$(hostname)] nccl-tests built successfully"
+    fi
+    TESTBIN="/tmp/nccl-tests/build"
+    for TEST in all_reduce all_gather reduce_scatter; do
+        echo "────────────────────────────────────────────────────────────"
+        echo "Running: ${TEST}_perf (intra-node, -g ${NGPUS})"
+        echo "────────────────────────────────────────────────────────────"
+        "${TESTBIN}/${TEST}_perf" \
+            -b "$MINBYTES" -e "$MAXBYTES" -f "$STEPFACTOR" \
+            -g "$NGPUS" -n "$ITERS" -w "$WARMUP" \
+            2>&1 | tee "${OUTDIR}/nccl_intra_${TEST}.log"
+        echo ""
+    done
+else
+    # ── INTER-NODE path: torchrun launches one process per GPU across nodes ──
+    # Writes a tiny Python script that measures the three collectives. This is
+    # what nccl-tests would do with MPI, but without requiring MPI infra.
+    PYFILE="${OUTDIR}/nccl_torch_bench.py"
+    cat > "${PYFILE}" <<'PYEOF'
+import os, time, datetime, torch, torch.distributed as dist
 
-for TEST in all_reduce all_gather reduce_scatter; do
-    echo "────────────────────────────────────────────────────────────"
-    echo "Running: ${TEST}_perf"
-    echo "────────────────────────────────────────────────────────────"
-    "${TESTBIN}/${TEST}_perf" \
-        -b "$MINBYTES" -e "$MAXBYTES" -f "$STEPFACTOR" \
-        -g "$NGPUS" -n "$ITERS" -w "$WARMUP" \
-        2>&1 | tee "${OUTDIR}/nccl_${TEST}.log"
-    echo ""
-done
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+dist.init_process_group("nccl", timeout=datetime.timedelta(minutes=10))
+rank, world = dist.get_rank(), dist.get_world_size()
+
+def fmt_bytes(b):
+    if b >= 1<<30: return f"{b/(1<<30):.2f} GB"
+    if b >= 1<<20: return f"{b/(1<<20):.0f} MB"
+    return f"{b/(1<<10):.0f} KB"
+
+def log(msg):
+    if rank == 0: print(msg, flush=True)
+
+minb = int(os.environ.get("NCCL_MIN_BYTES_PARSED", 8 * (1<<20)))
+maxb = int(os.environ.get("NCCL_MAX_BYTES_PARSED", 8 * (1<<30)))
+stepf = int(os.environ.get("NCCL_STEP_FACTOR", 2))
+iters = int(os.environ.get("NCCL_ITERS", 50))
+warmup = int(os.environ.get("NCCL_WARMUP", 20))
+
+def bench(op, size_bytes):
+    elems = size_bytes // 4  # float32
+    if op == "all_reduce":
+        buf = torch.zeros(elems, dtype=torch.float32, device=f"cuda:{local_rank}")
+        fn = lambda: dist.all_reduce(buf)
+        # algbw = bytes / time, busbw = algbw * 2*(n-1)/n
+        busbw_factor = 2 * (world - 1) / world
+    elif op == "all_gather":
+        shard = size_bytes // world
+        elems = shard // 4
+        inp = torch.zeros(elems, dtype=torch.float32, device=f"cuda:{local_rank}")
+        out = torch.empty(elems * world, dtype=torch.float32, device=f"cuda:{local_rank}")
+        fn = lambda: dist.all_gather_into_tensor(out, inp)
+        busbw_factor = (world - 1) / world
+    elif op == "reduce_scatter":
+        shard = size_bytes // world
+        elems = shard // 4
+        inp = torch.zeros(elems * world, dtype=torch.float32, device=f"cuda:{local_rank}")
+        out = torch.empty(elems, dtype=torch.float32, device=f"cuda:{local_rank}")
+        fn = lambda: dist.reduce_scatter_tensor(out, inp)
+        busbw_factor = (world - 1) / world
+    for _ in range(warmup): fn()
+    torch.cuda.synchronize(); dist.barrier()
+    t0 = time.perf_counter()
+    for _ in range(iters): fn()
+    torch.cuda.synchronize()
+    dt = (time.perf_counter() - t0) / iters
+    algbw = size_bytes / dt / 1e9
+    busbw = algbw * busbw_factor
+    return dt*1e6, algbw, busbw
+
+for op in ["all_reduce", "all_gather", "reduce_scatter"]:
+    log(f"\n{'─'*60}\nRunning: {op}_perf (inter-node, world={world})\n{'─'*60}")
+    log(f"#       size       count   type   time(us)   algbw(GB/s)   busbw(GB/s)")
+    s = minb
+    while s <= maxb:
+        dt_us, algbw, busbw = bench(op, s)
+        log(f"  {s:>12d}  {s//4:>10d}  float  {dt_us:>10.1f}  {algbw:>11.2f}  {busbw:>11.2f}  0")
+        s *= stepf
+
+dist.destroy_process_group()
+PYEOF
+
+    # Parse sizes like "8M" "8G" to bytes
+    parse_size() {
+        local s="$1"
+        case "$s" in
+            *G|*g) echo $(( ${s%[Gg]} * 1024 * 1024 * 1024 )) ;;
+            *M|*m) echo $(( ${s%[Mm]} * 1024 * 1024 )) ;;
+            *K|*k) echo $(( ${s%[Kk]} * 1024 )) ;;
+            *) echo "$s" ;;
+        esac
+    }
+    export NCCL_MIN_BYTES_PARSED=$(parse_size "$MINBYTES")
+    export NCCL_MAX_BYTES_PARSED=$(parse_size "$MAXBYTES")
+    export NCCL_STEP_FACTOR="$STEPFACTOR"
+    export NCCL_ITERS="$ITERS"
+    export NCCL_WARMUP="$WARMUP"
+
+    # torchrun expects MASTER_ADDR to be set by the sbatch wrapper
+    export MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR must be set in env}"
+    export MASTER_PORT="${MASTER_PORT:-29500}"
+
+    echo "torchrun: NNODES=${NNODES} NODE_RANK=${SLURM_NODEID:-0} NGPUS=${NGPUS} MASTER=${MASTER_ADDR}:${MASTER_PORT}"
+
+    # Combined log file for parser; tee lets us also see it live.
+    torchrun \
+        --nnodes="${NNODES}" \
+        --nproc_per_node="${NGPUS}" \
+        --node_rank="${SLURM_NODEID:-0}" \
+        --master_addr="${MASTER_ADDR}" \
+        --master_port="${MASTER_PORT}" \
+        "${PYFILE}" \
+        2>&1 | tee "${OUTDIR}/nccl_inter.log"
+
+    # Split the combined log into per-op logs so the existing parser still works.
+    awk '
+        /^Running: all_reduce_perf/     { out="'"${OUTDIR}"'/nccl_inter_all_reduce.log" }
+        /^Running: all_gather_perf/     { out="'"${OUTDIR}"'/nccl_inter_all_gather.log" }
+        /^Running: reduce_scatter_perf/ { out="'"${OUTDIR}"'/nccl_inter_reduce_scatter.log" }
+        out { print > out }
+    ' "${OUTDIR}/nccl_inter.log"
+fi
 RUNEOF
 )
 
@@ -142,10 +262,13 @@ if [[ "${NCCL_NODES}" -gt 1 ]]; then
         --time=00:45:00 \
         --output="${NCCL_DIR}/slurm-inter-%j.out" \
         --export=ALL,RESULTS_DIR="${NCCL_DIR}",BENCH_NCCL_ENV_FILE="${BENCH_NCCL_ENV_FILE}",NCCL_GPUS_PER_PROC="${GPUS_PER_NODE}",NCCL_MIN_BYTES=8M,NCCL_MAX_BYTES=8G,NCCL_ITERS=50,NCCL_WARMUP=20 \
-        --wrap="srun ${PYXIS_COMMON} \
-            --container-image=${NCCL_TEST_IMAGE} \
-            --container-mounts=${PYXIS_MOUNTS},${NCCL_DIR}:${NCCL_DIR} \
-            bash ${NCCL_RUNNER}" \
+        --wrap="
+            export MASTER_ADDR=\$(scontrol show hostnames \"\$SLURM_JOB_NODELIST\" | head -1)
+            export MASTER_PORT=29500
+            srun ${PYXIS_COMMON} \
+                --container-image=${NCCL_TEST_IMAGE} \
+                --container-mounts=${PYXIS_MOUNTS},${NCCL_DIR}:${NCCL_DIR} \
+                bash ${NCCL_RUNNER}" \
         2>&1) || { fail "Failed to submit inter-node NCCL job"; INTER_JOB=""; }
 
     [[ -n "$INTER_JOB" ]] && info "Inter-node NCCL job: ${INTER_JOB}"
@@ -178,9 +301,9 @@ extract_nccl_busbw() {
 parse_nccl_results() {
     header "Benchmark 02 — NCCL Results"
 
-    # Intra-node
+    # Intra-node — reads nccl_intra_*.log (written by phase A inside container)
     for test in all_reduce all_gather reduce_scatter; do
-        local logfile="${RESULTS_DIR}/02_nccl/nccl_${test}.log"
+        local logfile="${RESULTS_DIR}/02_nccl/nccl_intra_${test}.log"
         local bw threshold
         bw=$(extract_nccl_busbw "$logfile")
 
@@ -198,20 +321,19 @@ parse_nccl_results() {
         fi
     done
 
-    # Inter-node (results will be in same dir if multi-node job overwrites)
+    # Inter-node — reads nccl_inter_*.log (written by phase B after torchrun split)
     if [[ "${NCCL_NODES}" -gt 1 ]]; then
-        # Inter-node logs may have a different prefix or be in slurm output
-        local inter_log="${RESULTS_DIR}/02_nccl/slurm-inter-${INTER_JOB}.out"
-        if [[ -f "$inter_log" ]]; then
-            # Extract last all_reduce bus bandwidth from the combined output
+        for test in all_reduce all_gather reduce_scatter; do
+            local inter_logfile="${RESULTS_DIR}/02_nccl/nccl_inter_${test}.log"
             local inter_bw
-            inter_bw=$(grep -A 200 "all_reduce_perf" "$inter_log" | grep -E '^\s+[0-9]' | tail -1 | awk '{print $(NF-1)}' 2>/dev/null || echo "0")
-            [[ "$inter_bw" != "0" ]] \
-                && check_threshold "Inter-node all_reduce bus BW (${NCCL_NODES}N)" "$inter_bw" "$NCCL_INTER_BW_MIN_GBS" "GB/s" \
-                || record_skip "Inter-node all_reduce" "could not parse results"
-        else
-            record_skip "Inter-node NCCL" "output file not found"
-        fi
+            inter_bw=$(extract_nccl_busbw "$inter_logfile")
+
+            if [[ "$inter_bw" != "0" && -n "$inter_bw" ]]; then
+                check_threshold "Inter-node ${test} bus BW (${NCCL_NODES}N)" "$inter_bw" "$NCCL_INTER_BW_MIN_GBS" "GB/s"
+            else
+                record_skip "Inter-node ${test} (${NCCL_NODES}N)" "no results"
+            fi
+        done
     fi
 }
 

@@ -97,6 +97,11 @@ def main():
     from transformers import AutoConfig, AutoModelForCausalLM, CONFIG_MAPPING
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from torch.distributed.fsdp import MixedPrecision
+    from torch.distributed.fsdp.wrap import (
+        transformer_auto_wrap_policy,
+        size_based_auto_wrap_policy,
+    )
+    from functools import partial
 
     # ── Load config on rank 0 only, write to shared file, then barrier ───────
     config_path = os.path.join(train_dir, "hf_config.json")
@@ -159,8 +164,47 @@ def main():
     )
 
     print(f"[rank {global_rank}] wrapping with FSDP", flush=True)
+
+    # ── Discover transformer block class for per-layer FSDP wrapping ──────────
+    # Per-layer wrapping shrinks each all_gather from model-sized to layer-sized
+    # and enables forward/backward compute-comm overlap. Typical MFU gain: 2-3×.
+    #
+    # Strategy: look for a module attribute that HF uses to mark the repeating
+    # decoder block. Covers Qwen2, Llama, Mistral, Falcon, MPT, GPT-NeoX, etc.
+    def find_transformer_layer_cls(m):
+        # HF models set this on the base PreTrainedModel subclass. Walk the tree
+        # to find the module type whose class is listed there.
+        candidate_names = getattr(m, "_no_split_modules", None) or []
+        if not candidate_names:
+            return None
+        classes = set()
+        for sub in m.modules():
+            if type(sub).__name__ in candidate_names:
+                classes.add(type(sub))
+        return classes if classes else None
+
+    layer_classes = find_transformer_layer_cls(model)
+    if layer_classes:
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=layer_classes,
+        )
+        wrap_mode = f"transformer_auto_wrap ({', '.join(c.__name__ for c in layer_classes)})"
+    else:
+        # Fallback: wrap any module with > 100M params. Coarser but still beats
+        # single-monolith wrapping.
+        auto_wrap_policy = partial(
+            size_based_auto_wrap_policy,
+            min_num_params=int(1e8),
+        )
+        wrap_mode = "size_based_auto_wrap (100M param threshold)"
+
+    if global_rank == 0:
+        print(f"FSDP wrap policy: {wrap_mode}", flush=True)
+
     model = FSDP(
         model,
+        auto_wrap_policy=auto_wrap_policy,
         mixed_precision=bf16_policy,
         use_orig_params=True,
         sync_module_states=False,
@@ -317,6 +361,11 @@ fi
 # Override by setting NCCL_DEBUG=WARN in cluster.conf once things are stable.
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+# Disable SHARP/CollNet by default: NCCL 2.29 auto-probes these, and if the
+# IB-fabric mlx5_12-15 devices advertise SHARP but aren't in NCCL_IB_HCA, the
+# probe can hang or error. Explicitly off unless user opts in via cluster.conf.
+export NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
+export NCCL_SHARP_DISABLE="${NCCL_SHARP_DISABLE:-1}"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
